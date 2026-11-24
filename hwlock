@@ -1,0 +1,1292 @@
+#!/usr/bin/env python3
+"""hwlock: lightweight file-based hardware lease manager for coding agents.
+
+Coordinates exclusive access to shared physical test machines so multiple agents
+(or humans) don't flash, reboot, or benchmark on top of each other.
+
+Architecture:
+  - No daemon. Every CLI invocation is short-lived and coordinates through one
+    JSON file per machine under ~/.local/state/hwlock/ (override: $HWLOCK_STATE),
+    serialized by an advisory flock on .lock and updated atomically via os.replace.
+  - Machine inventory lives in ~/.config/hwlock/machines.json ($HWLOCK_CONFIG).
+  - History is appended to log.jsonl for auditing and post-hoc "why did I lose my
+    lease?" diagnostics.
+  - Leases expire unless renewed; `hwlock ssh`, `hwlock run`, and `hwlock wait-up`
+    automatically heartbeat-renew the lease every 60s while they run.
+  - Optional T3 Code integration: if $T3CODE_THREAD_ID is set, `--wait --notify`
+    queues a thread and delivers the lease token as a T3 message when it becomes
+    free, and `hwlock sweep` (intended for a 1-minute timer) nudges idle holders
+    and auto-releases leases held by settled or archived threads.
+
+Commands:
+  hwlock status [MACHINE] [--json]
+  hwlock acquire MACHINE --for "WHAT YOU ARE DOING" [--ttl 30m] [--max 8h]
+                 [--wait 1h [--notify]] [--quiet] [--as LABEL]
+      Prints a lease token (MACHINE.xxxxxxxx) on stdout. With --wait --notify
+      (T3 threads only), queues and exits immediately with code 6; the token
+      arrives later as a message to the thread.
+  hwlock dequeue MACHINE               Leave the --notify queue.
+  hwlock ssh TOKEN [--] CMD...         Run CMD over SSH: probes addresses and pins host keys.
+  hwlock run TOKEN [--] CMD...         Run a local CMD with $HWLOCK_SSH and $HWLOCK_HOST set.
+  hwlock wait-up TOKEN [--down-first] [--timeout 8m]
+  hwlock renew TOKEN [--ttl 30m] [--idle-ok]
+      --idle-ok tells sweep not to nudge your thread while it sits idle until expiry.
+  hwlock release TOKEN --state STATE [--note TEXT]
+  hwlock peek MACHINE [--] CMD...      Read-only SSH command without a lease (blocked by --quiet).
+  hwlock mark MACHINE STATE [--note TEXT] [--token TOKEN]
+  hwlock log [MACHINE] [-n 20]
+  hwlock clear MACHINE [--note TEXT]   (human) Reset machine state back to ok.
+  hwlock break MACHINE [--note TEXT]   (human) Drop someone's live lease.
+  hwlock sweep                         (timer) Nudge idle holders, release abandoned leases,
+                                       and hand free machines to --notify waiters.
+
+Machine states:
+  ok                  Ready for use.
+  trial-boot-pending  A one-shot / trial boot is staged and awaiting verification.
+  down                Machine is unreachable or powered off.
+  needs-human         Blocks all acquires until a human runs `hwlock clear`.
+  unknown             Previous lease was abandoned or state wasn't recorded.
+
+Exit codes:
+  0  ok
+  1  usage or unexpected error
+  2  busy (held or queued)
+  3  blocked (needs-human)
+  4  unreachable or timed out
+  5  lease lost or invalid token
+  6  queued asynchronously (--notify)
+"""
+
+import argparse
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------- configuration & constants ----------
+
+HOME = Path.home()
+STATE_DIR = Path(os.environ.get("HWLOCK_STATE") or HOME / ".local/state/hwlock")
+CONFIG = Path(os.environ.get("HWLOCK_CONFIG") or HOME / ".config/hwlock/machines.json")
+
+STATES = ("ok", "trial-boot-pending", "down", "needs-human", "unknown")
+# Any caller may escalate a machine to a degraded state without holding its lease;
+# returning it to `ok` or `trial-boot-pending` requires the active lease or `clear`.
+ESCALATIONS = ("down", "needs-human", "unknown")
+
+EXIT_BUSY, EXIT_HUMAN, EXIT_UNREACH, EXIT_LOST, EXIT_QUEUED = 2, 3, 4, 5, 6
+
+# Optional T3 Code CLI path and sweep timing knobs (overridable via env for testing).
+T3 = os.environ.get("HWLOCK_T3") or str(HOME / ".local/bin/t3")
+NUDGE_IDLE_S = int(os.environ.get("HWLOCK_NUDGE_IDLE_S") or 300)   # idle duration before first reminder
+NUDGE_GRACE_S = int(os.environ.get("HWLOCK_NUDGE_GRACE_S") or 600)  # grace period after reminder before auto-release
+MAX_NUDGES = 2
+NOTIFY_MAX_FAILS = 3
+
+HEARTBEAT_S = 60      # renew interval while ssh / run / wait-up is executing
+WAITER_STALE_S = 90   # polling --wait entries older than this are treated as dead
+POLL_S = 15           # sleep interval for blocking --wait loops
+
+
+# ---------- small helpers ----------
+
+def die(msg, code=1):
+    print(f"hwlock: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg=""):
+    print(msg, file=sys.stderr)
+
+
+def iso(t):
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def unix(s):
+    return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def clock(t):
+    d = datetime.fromtimestamp(t)
+    return d.strftime("%H:%M") if d.date() == datetime.now().date() else d.strftime("%b %d %H:%M")
+
+
+def span(sec):
+    sec = int(abs(sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    if sec < 86400:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{sec // 86400}d{sec % 86400 // 3600}h"
+
+
+def dur(s):
+    """Parse durations like '30m', '2h', '1h30m', '90s', '1d'; a bare integer is minutes."""
+    s = str(s).strip().lower()
+    if s.isdigit():
+        return int(s) * 60
+    m = re.fullmatch(r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", s)
+    if not s or not m:
+        raise argparse.ArgumentTypeError(f"bad duration {s!r} (use e.g. 30m, 2h, 1h30m)")
+    d, h, mi, se = (int(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + se
+
+
+def lid(token):
+    """Hash a bearer token into a stored lease ID so state files don't expose raw tokens."""
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def is_agent():
+    """Best-effort detection of whether hwlock is being invoked by an AI coding agent."""
+    e = os.environ
+    return bool(e.get("AI_AGENT") or e.get("CLAUDECODE") or any(k.startswith("CODEX") for k in e))
+
+
+def ssh_user(c, m=None):
+    """Resolve the SSH username: per-machine override > config default > current OS user."""
+    if m and c["machines"][m].get("user"):
+        return c["machines"][m]["user"]
+    return c.get("user") or getpass.getuser()
+
+
+# ---------- config and on-disk state ----------
+
+def load_cfg():
+    try:
+        return json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        die(f"no machine list at {CONFIG}")
+
+
+def resolve(c, name):
+    """Resolve a canonical machine name or case-insensitive alias from machines.json."""
+    n = name.lower()
+    for k, m in c["machines"].items():
+        if n == k.lower() or n in (a.lower() for a in m.get("aliases", [])):
+            return k
+    known = ", ".join(
+        f"{k} ({'/'.join(m.get('aliases', []))})" if m.get("aliases") else k
+        for k, m in c["machines"].items()
+    )
+    die(f"unknown machine {name!r}; known: {known}")
+
+
+def nick(c, m):
+    a = c["machines"][m].get("aliases", [])
+    return f"{m} ({a[0]})" if a else m
+
+
+@contextmanager
+def locked():
+    """Serialize all state reads/writes across processes via an exclusive flock."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / ".lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def load(m):
+    try:
+        d = json.loads((STATE_DIR / f"{m}.json").read_text())
+    except FileNotFoundError:
+        d = {}
+    d.setdefault("machine", m)
+    d.setdefault("lease", None)
+    d.setdefault("state", "ok")
+    d.setdefault("note", "")
+    d.setdefault("waiters", [])
+    return d
+
+
+def save(d):
+    """Atomically replace a machine's JSON state file (callers must hold locked())."""
+    p = STATE_DIR / f"{d['machine']}.json"
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=2) + "\n")
+    os.replace(tmp, p)
+
+
+def log(event, machine, **kw):
+    """Append a structured audit event to log.jsonl."""
+    with open(STATE_DIR / "log.jsonl", "a") as f:
+        f.write(json.dumps({"t": iso(time.time()), "event": event, "machine": machine, **kw}) + "\n")
+
+
+def read_log():
+    try:
+        lines = (STATE_DIR / "log.jsonl").read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return out
+
+
+# ---------- caller identity ----------
+
+def thread_title(tid):
+    """Look up a human-readable T3 Code thread title from its local SQLite projection, if present."""
+    db = Path(os.environ.get("T3CODE_HOME") or HOME / ".t3") / "userdata/statev2.sqlite"
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+    except Exception:
+        return None
+    try:
+        for q in (
+            "select title from orchestration_v2_projection_threads where thread_id=?",
+            "select title from projection_threads where thread_id=?",
+        ):
+            try:
+                r = con.execute(q, (tid,)).fetchone()
+                if r and r[0]:
+                    return r[0]
+            except sqlite3.Error:
+                pass
+    finally:
+        con.close()
+    return None
+
+
+def holder(label=None):
+    """Build a metadata dictionary describing who is acquiring or marking a machine."""
+    e = os.environ
+    agent = e.get("AI_AGENT", "").split("_")[0]
+    if not agent:
+        agent = (
+            "codex" if any(k.startswith("CODEX") for k in e)
+            else "claude-code" if e.get("CLAUDECODE")
+            else "shell"
+        )
+    h = {"agent": agent, "host": os.uname().nodename, "cwd": os.getcwd().replace(str(HOME), "~", 1)}
+    if e.get("T3CODE_THREAD_ID"):
+        h["t3_thread"] = e["T3CODE_THREAD_ID"]
+        title = thread_title(e["T3CODE_THREAD_ID"])
+        if title:
+            h["thread_title"] = title
+    if e.get("CLAUDE_CODE_SESSION_ID"):
+        h["session"] = e["CLAUDE_CODE_SESSION_ID"]
+    if e.get("SSH_CONNECTION"):
+        h["via_ssh_from"] = e["SSH_CONNECTION"].split()[0]
+    h["label"] = label or h.get("thread_title") or f"{agent} in {h['cwd']}"
+    return h
+
+
+def who(h):
+    bits = [h.get("agent", "?")]
+    if h.get("t3_thread"):
+        bits.append(f"T3 thread {h['t3_thread'].removeprefix('thread:')[:8]}")
+    if h.get("via_ssh_from"):
+        bits.append(f"via ssh from {h['via_ssh_from']}")
+    return f"\"{h.get('label', '?')}\" ({', '.join(bits)})"
+
+
+# ---------- lease lifecycle ----------
+
+def live(lease, t):
+    return bool(lease) and unix(lease["expires"]) > t
+
+
+def waiter_live(w, t):
+    # --notify waiters have no running process; they stay queued until their deadline.
+    # Blocking --wait callers refresh `seen` every POLL_S and expire if killed unexpectedly.
+    if w.get("notify"):
+        return t < unix(w["until"])
+    return t - unix(w["seen"]) < WAITER_STALE_S
+
+
+def live_waiters(d, t):
+    return [w for w in d["waiters"] if waiter_live(w, t)]
+
+
+def new_lease(d, h, purpose, quiet, ttl, mx, t, via=None, log_it=True):
+    """Mint a fresh bearer token, store its hashed lease ID in state, and return (token, prev_lease)."""
+    token = f"{d['machine']}.{secrets.token_hex(4)}"
+    prev = d["lease"]
+    d["lease"] = {
+        "id": lid(token),
+        "holder": h,
+        "purpose": purpose,
+        "quiet": quiet,
+        "acquired": iso(t),
+        "renewed": iso(t),
+        "ttl_s": ttl,
+        "max_s": mx,
+        "expires": iso(t + min(ttl, mx)),
+    }
+    if log_it:
+        log_acquire(d["machine"], d["lease"], prev, via)
+    return token, prev
+
+
+def log_acquire(m, lease, prev, via=None):
+    h = lease["holder"]
+    log(
+        "acquire", m,
+        lease=lease["id"],
+        holder=h["label"],
+        agent=h["agent"],
+        t3_thread=h.get("t3_thread"),
+        purpose=lease["purpose"],
+        prev_lease=prev["id"] if prev else None,
+        via=via,
+    )
+
+
+def token_machine(c, token):
+    if "." not in token:
+        die(f"{token!r} isn't a lease token (tokens look like lab-box.1a2b3c4d; hwlock acquire prints one)", EXIT_LOST)
+    return resolve(c, token.rsplit(".", 1)[0])
+
+
+def what_happened(token):
+    """Search log.jsonl in reverse to explain why a caller's token is no longer active."""
+    i = lid(token)
+    for ev in reversed(read_log()):
+        if ev.get("lease") == i or ev.get("prev_lease") == i:
+            at = clock(unix(ev["t"]))
+            if ev["event"] == "release":
+                return f"you released it at {at} (state {ev.get('state')})"
+            if ev["event"] == "break":
+                return f"the user broke your lease at {at}: {ev.get('note') or 'no note'}"
+            if ev["event"] == "auto-release":
+                return f"hwlock auto-released it at {at}: {ev.get('reason') or 'idle'}"
+            if ev["event"] == "acquire" and ev.get("prev_lease") == i:
+                return f"your lease expired and {ev.get('holder')!r} took the machine over at {at}"
+    return "no lease with that token exists"
+
+
+def claim(d, token, t, releasing=False):
+    """Validate that TOKEN owns the machine's current lease, else exit with EXIT_LOST.
+
+    If a lease expired past its TTL (but not its max_s cap) and nobody else claimed
+    the machine yet, we silently reclaim it on behalf of the same holder rather than
+    forcing a redundant re-acquire.
+    """
+    lease = d["lease"]
+    if lease and lease["id"] == lid(token):
+        if unix(lease["expires"]) <= t and not releasing:
+            if t >= unix(lease["acquired"]) + lease["max_s"]:
+                die(
+                    f"your lease on {d['machine']} reached its maximum hold ({span(lease['max_s'])}). "
+                    f"Release it (hwlock release {token} --state ...) and acquire again if you still need it.",
+                    EXIT_LOST,
+                )
+            say(
+                f"hwlock: note: your lease on {d['machine']} expired {span(t - unix(lease['expires']))} ago; "
+                "nobody took it, so it is renewed"
+            )
+        return lease
+    now_held = (
+        f" It is now checked out by {who(lease['holder'])} for \"{lease['purpose']}\"."
+        if live(lease, t)
+        else ""
+    )
+    die(
+        f"you no longer hold {d['machine']}: {what_happened(token)}.{now_held} "
+        "Stop changing anything on that machine.",
+        EXIT_LOST,
+    )
+
+
+def extend(lease, t, ttl=None):
+    """Push lease expiry forward by ttl_s, clamped to acquired + max_s. Returns True if capped."""
+    if ttl:
+        lease["ttl_s"] = ttl
+    cap = unix(lease["acquired"]) + lease["max_s"]
+    lease["expires"] = iso(min(t + lease["ttl_s"], cap))
+    lease["renewed"] = iso(t)
+    return t + lease["ttl_s"] > cap
+
+
+def lost_reason(m, token):
+    with locked():
+        lease = load(m)["lease"]
+    if lease and lease["id"] == lid(token):
+        return f"it reached its maximum hold of {span(lease['max_s'])}; release and acquire again"
+    return what_happened(token)
+
+
+def heartbeat(m, token):
+    """Extend an active lease during a long-running command; return False if ownership was lost."""
+    t = time.time()
+    with locked():
+        d = load(m)
+        lease = d["lease"]
+        if not lease or lease["id"] != lid(token) or t >= unix(lease["acquired"]) + lease["max_s"]:
+            return False
+        extend(lease, t)
+        save(d)
+        return True
+
+
+# ---------- optional T3 Code thread integration ----------
+
+def t3(*args, stdin=None):
+    try:
+        r = subprocess.run([T3, *args], input=stdin, capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    return (r.stdout if r.returncode == 0 else None), r.stderr.strip()[-300:]
+
+
+def thread_info(tid):
+    out, _ = t3("thread", "show", tid, "--json", "--messages", "0")
+    try:
+        return json.loads(out)["thread"] if out else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def tell(tid, text):
+    out, err = t3("thread", "send", tid, "-", stdin=text)
+    if out is None:
+        say(f"hwlock: couldn't message thread {tid}: {err}")
+    return out is not None
+
+
+def nudge_text(c, m, lease, ws, t):
+    idle_s = t - unix(lease["idle_since"])
+    idle = f"it has been idle for {span(idle_s)}" if idle_s >= 60 else "it is idle"
+    exp = "" if live(lease, t) else f", and the lease expired {span(t - unix(lease['expires']))} ago"
+    q = ""
+    if ws:
+        q = (
+            f"\n{len(ws)} other agent{'s are' if len(ws) > 1 else ' is'} queued for it: "
+            + ", ".join(f"\"{w['label']}\" (for \"{w['purpose']}\")" for w in ws) + "."
+        )
+    return (
+        f"[hwlock] This thread still holds {nick(c, m)}, checked out "
+        f"{span(t - unix(lease['acquired']))} ago for \"{lease['purpose']}\", but {idle}{exp}.{q}\n"
+        f"- Done with it? Release it now with the token acquire gave you ({m}.xxxxxxxx):\n"
+        f"  hwlock release <token> --state ok|trial-boot-pending|down|needs-human --note \"<what you left it in>\"\n"
+        f"- Still using it, or waiting on the user on purpose? Run hwlock renew <token> --idle-ok, then end your turn.\n"
+        f"- Lost the token? Say so, and describe the machine's state in your reply.\n"
+        f"If nothing happens within {span(NUDGE_GRACE_S)}, hwlock releases it with state unknown."
+    )
+
+
+def grant_text(c, m, token, lease, prev, state, note, t):
+    took = ""
+    if prev:
+        took = (
+            f" You took over a lease that expired without a release ({prev['holder'].get('label')}, for "
+            f"\"{prev['purpose']}\"): look before you change anything."
+        )
+    return (
+        f"[hwlock] Your turn: {nick(c, m)} is now checked out to this thread for \"{lease['purpose']}\" "
+        f"(you queued with --notify).\nToken: {token}\n"
+        f"The lease runs {span(lease['ttl_s'])} and every hwlock ssh / run / wait-up renews it. "
+        f"Machine state: {state}" + (f": {note}" if note else "") + f".{took}\n"
+        f"Work through hwlock ssh {token} -- <cmd>. Release with hwlock release {token} --state ... --note \"...\" "
+        f"when done, or right away (with --state {state}) if you no longer need it."
+    )
+
+
+def grant_notified(c, m):
+    """Hand a free machine to the head of the queue if it used --notify.
+
+    We reserve the lease under flock, release the lock before shelling out to `t3`
+    (so network/IPC latency never stalls other machines), and roll the lease back
+    if message delivery fails so the token is never silently orphaned.
+    """
+    t = time.time()
+    with locked():
+        d = load(m)
+        ws = live_waiters(d, t)
+        if live(d["lease"], t) or d["state"] == "needs-human" or not ws or not ws[0].get("notify"):
+            if len(ws) != len(d["waiters"]):
+                d["waiters"] = ws
+                save(d)
+            return
+        w = ws[0]
+        token, prev = new_lease(d, w["holder"], w["purpose"], w.get("quiet", False), w["ttl_s"], w["max_s"], t, log_it=False)
+        lease = d["lease"]
+        d["waiters"] = ws[1:]
+        save(d)
+        state, note = d["state"], d["note"]
+    if tell(w["notify"], grant_text(c, m, token, lease, prev, state, note, t)):
+        log_acquire(m, lease, prev, via="notify")
+        return
+    # Delivery failed: roll back the lease and re-queue the waiter up to NOTIFY_MAX_FAILS times.
+    with locked():
+        d = load(m)
+        if d["lease"] and d["lease"]["id"] == lease["id"]:
+            d["lease"] = prev
+            w["fails"] = w.get("fails", 0) + 1
+            if w["fails"] < NOTIFY_MAX_FAILS:
+                d["waiters"].insert(0, w)
+            save(d)
+    log("notify-failed", m, lease=lease["id"], holder=w["label"], reason=f"attempt {w.get('fails', 1)}")
+
+
+def sweep_machine(c, m, cache, urgent=False):
+    """Check one machine's holder thread; nudge if idle, auto-release if abandoned, and serve --notify."""
+    grant_notified(c, m)
+    with locked():
+        lease = load(m)["lease"]
+    tid = lease and lease["holder"].get("t3_thread")
+    if not tid:
+        return
+    # Query T3 outside the flock, then verify the lease snapshot didn't change before mutating.
+    snap = lease["id"]
+    if tid not in cache:
+        cache[tid] = thread_info(tid)
+    info = cache[tid]
+    if not info:
+        return  # T3 unreachable or thread unknown: fall back to normal lease expiry
+    gone = info.get("archived") or info.get("settled")
+    active = (
+        info.get("status") in ("running", "waiting")
+        or info.get("pendingRequestCount")
+        or info.get("pendingBackgroundTasks")
+        or info.get("blockedOnThreadWait")
+    )
+    t = time.time()
+    act = None
+    with locked():
+        d = load(m)
+        lease = d["lease"]
+        if not lease or lease["id"] != snap:  # lease changed hands while we queried T3
+            return
+        if gone:
+            act = ("release", f"thread was {'archived' if info.get('archived') else 'settled'}")
+        elif active:
+            changed = lease.pop("idle_since", None) is not None
+            changed = (lease.pop("nudged", None) is not None) or changed
+            if changed:
+                save(d)
+        elif lease.get("idle_ok_until") and t < unix(lease["idle_ok_until"]):
+            pass
+        else:
+            lease.setdefault("idle_since", iso(t))
+            idle = t - unix(lease["idle_since"])
+            n = lease.get("nudges", 0)
+            if lease.get("nudged"):
+                if t - unix(lease["nudged"]) >= NUDGE_GRACE_S:
+                    act = ("release", f"thread sat idle {span(idle)} and didn't answer the reminder")
+            elif n < MAX_NUDGES:
+                # Nudge immediately if someone is waiting or the lease already expired.
+                if idle >= NUDGE_IDLE_S or urgent or live_waiters(d, t) or not live(lease, t):
+                    lease["nudged"], lease["nudges"] = iso(t), n + 1
+                    act = ("nudge", None)
+            elif idle >= NUDGE_GRACE_S:
+                act = ("release", f"thread sat idle {span(idle)} after {n} reminders")
+            save(d)
+        if act and act[0] == "release":
+            d["lease"] = None
+            d["state"], d["state_by"], d["state_at"] = "unknown", "hwlock sweep", iso(t)
+            d["note"] = (
+                f"auto-released: holder {who(lease['holder'])} {act[1]} while holding it for "
+                f"\"{lease['purpose']}\". Nobody recorded the state: look before you change anything."
+            )
+            save(d)
+            log("auto-release", m, lease=lease["id"], holder=lease["holder"]["label"], reason=act[1])
+        ws = live_waiters(d, t)
+    if act and act[0] == "nudge":
+        sent = tell(tid, nudge_text(c, m, lease, ws, t))
+        log("nudge", m, lease=lease["id"], holder=lease["holder"]["label"], reason="sent" if sent else "send failed")
+        if not sent:
+            # Undo nudge bookkeeping so the next sweep retries instead of burning a nudge count.
+            with locked():
+                d = load(m)
+                if d["lease"] and d["lease"]["id"] == lease["id"]:
+                    d["lease"].pop("nudged", None)
+                    d["lease"]["nudges"] = max(0, d["lease"].get("nudges", 1) - 1)
+                    save(d)
+    elif act:
+        grant_notified(c, m)
+
+
+def cmd_sweep(c, a):
+    cache = {}
+    for m in c["machines"]:
+        try:
+            sweep_machine(c, m, cache)
+        except Exception as e:  # one corrupt machine file must never block sweeping the rest
+            say(f"hwlock sweep: {m}: {e!r}")
+
+
+def cmd_dequeue(c, a):
+    m = resolve(c, a.machine)
+    tid = os.environ.get("T3CODE_THREAD_ID")
+    if not tid:
+        die("no T3CODE_THREAD_ID here, so there is no --notify queue entry of yours to drop")
+    with locked():
+        d = load(m)
+        before = len(d["waiters"])
+        d["waiters"] = [w for w in d["waiters"] if w.get("notify") != tid]
+        save(d)
+    n = before - len(d["waiters"])
+    if n:
+        log("dequeue", m, holder=holder()["label"])
+    say(f"Left the queue for {nick(c, m)}." if n else f"This thread wasn't queued for {nick(c, m)}.")
+
+
+# ---------- SSH address probing & child supervision ----------
+
+def ssh_base(c, m):
+    """Build a non-interactive SSH command pinned to the machine's expected host key.
+
+    StrictHostKeyChecking=yes + HostKeyAlias ensures that if DHCP or mDNS points an
+    address at a *different* lab machine, SSH refuses to connect instead of running
+    destructive commands on the wrong host.
+    """
+    mc = c["machines"][m]
+    cmd = ["ssh"]
+    identity = mc.get("identity") or c.get("identity")
+    if identity:
+        cmd += ["-i", os.path.expanduser(identity), "-o", "IdentitiesOnly=yes"]
+    cmd += [
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"HostKeyAlias={mc['host_key_alias']}",
+        "-o", "ConnectTimeout=5",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=4",
+        "-o", "LogLevel=ERROR",
+        "-l", ssh_user(c, m),
+    ]
+    return cmd
+
+
+def probe(c, m):
+    """Try configured addresses (last-known-good first) until the expected host key answers."""
+    with locked():
+        last = load(m).get("last_addr")
+    addrs = c["machines"][m]["addrs"]
+    if last in addrs:
+        addrs = [last] + [a for a in addrs if a != last]
+    why = []
+    for a in addrs:
+        try:
+            r = subprocess.run(
+                ssh_base(c, m) + [a, "true"],
+                capture_output=True, text=True, timeout=12, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            why.append(f"{a}: timed out")
+            continue
+        if r.returncode == 0:
+            if a != last:
+                with locked():
+                    d = load(m)
+                    d["last_addr"] = a
+                    save(d)
+            return a, why
+        err = r.stderr
+        if "IDENTIFICATION HAS CHANGED" in err or "Host key verification failed" in err:
+            why.append(f"{a}: answered with another machine's host key (not {m})")
+        else:
+            lines = [ln for ln in err.strip().splitlines() if ln.strip() and not ln.startswith("@")]
+            why.append(f"{a}: {lines[-1] if lines else 'exit ' + str(r.returncode)}")
+    return None, why
+
+
+def run_child(argv, m, token, env=None):
+    """Run a child command while heartbeating the lease every HEARTBEAT_S seconds.
+
+    If the lease is broken or hits its max hold mid-command, we print a loud warning
+    on stderr rather than SIGKILLing the child (killing a flash/deploy midway can
+    leave hardware half-written).
+    """
+    p = subprocess.Popen(argv, env=env)
+    fwd = lambda sig, _f: p.send_signal(sig)
+    signal.signal(signal.SIGTERM, fwd)
+    signal.signal(signal.SIGHUP, fwd)
+    signal.signal(signal.SIGINT, lambda *_: None)  # child receives ^C directly from the terminal
+    warned = False
+    while True:
+        try:
+            return p.wait(timeout=HEARTBEAT_S)
+        except subprocess.TimeoutExpired:
+            if not heartbeat(m, token) and not warned:
+                warned = True
+                say(
+                    f"hwlock: WARNING: you no longer hold {m} ({lost_reason(m, token)}). "
+                    "Stop this command and don't change anything else on the machine."
+                )
+
+
+# ---------- CLI commands ----------
+
+def describe(c, d, t):
+    m = d["machine"]
+    lease = d["lease"]
+    out = []
+    if live(lease, t):
+        h = lease["holder"]
+        q = "  [quiet: no ssh at all, measurement running]" if lease.get("quiet") else ""
+        out.append(f"{nick(c, m)}  HELD by {who(h)}{q}")
+        out.append(f"    for: {lease['purpose']}")
+        out.append(
+            f"    since {clock(unix(lease['acquired']))} ({span(t - unix(lease['acquired']))}), "
+            f"expires {clock(unix(lease['expires']))} (in {span(unix(lease['expires']) - t)}), lease {lease['id'][:8]}"
+        )
+    elif lease:
+        blocked = "BLOCKED: needs the user; last" if d["state"] == "needs-human" else "free (last"
+        out.append(
+            f"{nick(c, m)}  {blocked} lease by {who(lease['holder'])} for \"{lease['purpose']}\" "
+            f"expired {span(t - unix(lease['expires']))} ago without a release: check its state before changing anything"
+            + (")" if d["state"] != "needs-human" else "")
+        )
+    elif d["state"] == "needs-human":
+        out.append(f"{nick(c, m)}  BLOCKED: needs the user (hwlock clear {m} once it's sorted)")
+    else:
+        out.append(f"{nick(c, m)}  free")
+    if d["state"] != "ok" or d["note"]:
+        by = f" ({d.get('state_by', '?')}, {span(t - unix(d['state_at']))} ago)" if d.get("state_at") else ""
+        note = f": {d['note']}" if d["note"] else ""
+        out.append(f"    state {d['state'].upper() if d['state'] != 'ok' else 'ok'}{note}{by}")
+    for i, w in enumerate(live_waiters(d, t)):
+        how = f", gets a message, queued until {clock(unix(w['until']))}" if w.get("notify") else ""
+        out.append(f"    queued #{i + 1}: \"{w['label']}\" for \"{w['purpose']}\" (waiting {span(t - unix(w['since']))}{how})")
+    return out
+
+
+def cmd_status(c, a):
+    t = time.time()
+    ms = [resolve(c, a.machine)] if a.machine else list(c["machines"])
+    with locked():
+        ds = [load(m) for m in ms]
+    if a.json:
+        out = []
+        for d in ds:
+            m, lease, mc = d["machine"], d["lease"], c["machines"][d["machine"]]
+            held = live(lease, t)
+            ws = live_waiters(d, t)
+            out.append({
+                "machine": m,
+                "aliases": mc.get("aliases", []),
+                "desc": mc.get("desc"),
+                "free": not held and not ws and d["state"] != "needs-human",
+                "held": held,
+                "quiet": bool(held and lease.get("quiet")),
+                "holder": (
+                    {k: v for k, v in lease["holder"].items() if k in ("label", "agent", "t3_thread", "thread_title")}
+                    if held
+                    else None
+                ),
+                "purpose": lease["purpose"] if held else None,
+                "acquired": lease["acquired"] if held else None,
+                "expires": lease["expires"] if held else None,
+                "expires_in_s": int(unix(lease["expires"]) - t) if held else None,
+                "stale_lease": bool(lease and not held),
+                "state": d["state"],
+                "note": d["note"],
+                "state_by": d.get("state_by"),
+                "state_at": d.get("state_at"),
+                "waiters": [
+                    {
+                        "label": w["label"],
+                        "purpose": w["purpose"],
+                        "since": w["since"],
+                        "notify": bool(w.get("notify")),
+                        "until": w.get("until"),
+                    }
+                    for w in ws
+                ],
+            })
+        print(json.dumps(out, indent=2))
+        return
+    for d in ds:
+        print("\n".join(describe(c, d, t)))
+
+
+def busy_text(c, d, t, mine=None):
+    m = d["machine"]
+    lease = d["lease"]
+    lines = []
+    if d["state"] == "needs-human":
+        by = f" by {d.get('state_by', '?')} {span(t - unix(d['state_at']))} ago" if d.get("state_at") else ""
+        lines.append(
+            f"{nick(c, m)} is marked NEEDS-HUMAN{by}: {d['note'] or 'no note'}. "
+            f"Only the user can clear it (hwlock clear {m}). Tell the user."
+        )
+    if live(lease, t):
+        lines.append(
+            f"{nick(c, m)} is checked out by {who(lease['holder'])} for \"{lease['purpose']}\", since "
+            f"{clock(unix(lease['acquired']))} ({span(t - unix(lease['acquired']))} ago), expires "
+            f"{clock(unix(lease['expires']))} (in {span(unix(lease['expires']) - t)})."
+        )
+    ws = [w for w in live_waiters(d, t) if w["id"] != mine]
+    if ws:
+        lines.append(f"{len(ws)} queued ahead: " + ", ".join(f"\"{w['label']}\"" for w in ws) + ".")
+    return lines
+
+
+def cmd_acquire(c, a):
+    m = resolve(c, a.machine)
+    ttl = a.ttl or dur(c.get("default_ttl", "30m"))
+    mx = a.max or dur(c.get("max_hold", "8h"))
+    if mx > 86400:
+        die("--max is capped at 24h")
+    if a.notify and not a.wait:
+        die("--notify goes with --wait: hwlock acquire MACHINE --for \"...\" --wait 1h --notify")
+    h = holder(a.as_)
+    if a.notify and not h.get("t3_thread"):
+        die("--notify needs a T3 thread to message (no T3CODE_THREAD_ID here). Use --wait in the background instead.")
+    deadline = time.time() + a.wait if a.wait else None
+    me = None
+    announced = False
+    nudged = False
+    if a.notify:  # reuse this thread's existing --notify slot so re-running updates it in place
+        with locked():
+            me = next((w["id"] for w in load(m)["waiters"] if w.get("notify") == h["t3_thread"]), None)
+
+    def leave_queue():
+        if me:
+            with locked():
+                d = load(m)
+                d["waiters"] = [w for w in d["waiters"] if w["id"] != me]
+                save(d)
+
+    def on_term(*_):
+        raise KeyboardInterrupt  # unwind out of locked() cleanly before removing our queue entry
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGHUP, on_term)
+    try:
+        while True:
+            t = time.time()
+            with locked():
+                d = load(m)
+                ws = live_waiters(d, t)
+                lease = d["lease"]
+                # Strict FIFO: even if the machine is free, wait behind anyone ahead in the queue.
+                blocked = d["state"] == "needs-human" or live(lease, t) or (ws and (not me or ws[0]["id"] != me))
+                if not blocked:
+                    token, prev = new_lease(d, h, a.purpose, a.quiet, ttl, mx, t)
+                    d["waiters"] = [w for w in ws if w["id"] != me]
+                    save(d)
+                    me = None
+                    state = d["state"]
+                    note = d["note"]
+                    break
+                head_notify = (
+                    not live(lease, t)
+                    and d["state"] != "needs-human"
+                    and ws
+                    and ws[0].get("notify")
+                    and ws[0]["id"] != me
+                )
+                if a.notify and t < deadline:
+                    w = next((w for w in ws if w["id"] == me), None)
+                    entry = {
+                        "label": h["label"],
+                        "purpose": a.purpose,
+                        "notify": h["t3_thread"],
+                        "holder": h,
+                        "until": iso(deadline),
+                        "ttl_s": ttl,
+                        "max_s": mx,
+                        "quiet": a.quiet,
+                    }
+                    if w:
+                        w.update(entry)
+                    else:
+                        w = dict(entry, id=secrets.token_hex(4), since=iso(t), seen=iso(t))
+                        ws.append(w)
+                    d["waiters"] = ws
+                    save(d)
+                    pos = ws.index(w) + 1
+                    msg = busy_text(c, d, t, w["id"])
+                    log("queue", m, holder=h["label"], purpose=a.purpose, reason=f"--notify, #{pos}")
+                elif deadline and t < deadline:
+                    if not me:
+                        me = secrets.token_hex(4)
+                        d["waiters"] = ws + [{
+                            "id": me,
+                            "label": h["label"],
+                            "purpose": a.purpose,
+                            "pid": os.getpid(),
+                            "since": iso(t),
+                            "seen": iso(t),
+                        }]
+                    else:
+                        d["waiters"] = [dict(w, seen=iso(t)) if w["id"] == me else w for w in ws]
+                    save(d)
+                    msg = busy_text(c, d, t, me)
+            if a.notify:
+                say(f"hwlock: queued #{pos} for {nick(c, m)}, for up to {span(a.wait)}:\n  " + "\n  ".join(msg))
+                say(
+                    "  When it's yours, hwlock messages this thread with the token, and the lease starts then. Until then "
+                    f"don't touch the machine. You can end your turn or do other work. To leave the queue: hwlock dequeue {m}"
+                )
+                sweep_machine(c, m, {}, urgent=True)
+                sys.exit(EXIT_QUEUED)
+            if not deadline or t >= deadline:
+                leave_queue()
+                with locked():
+                    msg = busy_text(c, load(m), t, me)
+                say("hwlock: " + "\n  ".join(msg))
+                if deadline:
+                    say(f"  Gave up after waiting {span(a.wait)}.")
+                else:
+                    say(
+                        f"  Don't touch the machine. Options: wait for it (hwlock acquire {m} --for \"...\" --wait 1h, "
+                        "in the background), work on something else, or tell the user."
+                    )
+                sys.exit(EXIT_HUMAN if d["state"] == "needs-human" else EXIT_BUSY)
+            if not announced:
+                announced = True
+                say("hwlock: waiting (up to " + span(a.wait) + "): " + "\n  ".join(msg))
+            if head_notify:
+                grant_notified(c, m)
+            if not nudged:  # nudge an idle holder immediately once another agent is waiting
+                nudged = True
+                sweep_machine(c, m, {}, urgent=True)
+            time.sleep(POLL_S)
+    except KeyboardInterrupt:
+        leave_queue()
+        sys.exit(EXIT_BUSY)
+
+    print(token)
+    say(
+        f"Checked out {nick(c, m)} until {clock(t + min(ttl, mx))} ({span(min(ttl, mx))}). "
+        "Every hwlock ssh / run / wait-up renews it; hwlock renew does too."
+    )
+    if prev:
+        say(
+            f"Took over a lease that expired without a release: {who(prev['holder'])} for \"{prev['purpose']}\", "
+            f"expired {span(t - unix(prev['expires']))} ago. The machine may be mid-test or in an unexpected boot state: "
+            "look before you change anything."
+        )
+    say(f"Machine state: {state}" + (f": {note}" if note else ""))
+    say(f"Release when done: hwlock release {token} --state ok|trial-boot-pending|down|needs-human --note \"...\"")
+
+
+def cmd_renew(c, a):
+    m = token_machine(c, a.token)
+    t = time.time()
+    with locked():
+        d = load(m)
+        lease = claim(d, a.token, t)
+        capped = extend(lease, t, a.ttl)
+        lease.pop("nudged", None)
+        lease.pop("idle_since", None)
+        if a.idle_ok:
+            lease["idle_ok_until"] = lease["expires"]
+        save(d)
+    log("renew", m, lease=lease["id"])
+    say(
+        f"Renewed {m} until {clock(unix(lease['expires']))}."
+        + (" No reminders until then while your thread is idle." if a.idle_ok else "")
+        + (" That is its maximum hold: release and acquire again if you need longer." if capped else "")
+    )
+
+
+def cmd_release(c, a):
+    m = token_machine(c, a.token)
+    t = time.time()
+    with locked():
+        d = load(m)
+        lease = claim(d, a.token, t, releasing=True)
+        d["lease"] = None
+        d["state"], d["note"] = a.state, a.note or ""
+        d["state_by"], d["state_at"] = lease["holder"]["label"], iso(t)
+        save(d)
+    log(
+        "release", m,
+        lease=lease["id"],
+        holder=lease["holder"]["label"],
+        state=a.state,
+        note=a.note,
+        held_s=int(t - unix(lease["acquired"])),
+    )
+    say(f"Released {nick(c, m)} after {span(t - unix(lease['acquired']))}. State {a.state}" + (f": {a.note}" if a.note else "."))
+    grant_notified(c, m)
+
+
+def cmd_ssh(c, a):
+    m = token_machine(c, a.token)
+    t = time.time()
+    with locked():
+        d = load(m)
+        extend(claim(d, a.token, t), t)
+        save(d)
+    addr, why = probe(c, m)
+    if not addr:
+        die(
+            f"{m} isn't reachable: " + "; ".join(why) + ". Your lease is kept. If it is rebooting, "
+            f"use hwlock wait-up {a.token}; if it should be up, tell the user.",
+            EXIT_UNREACH,
+        )
+    tty = ["-t"] if not a.cmd and sys.stdin.isatty() else []
+    sys.exit(run_child(ssh_base(c, m) + tty + [addr] + a.cmd, m, a.token))
+
+
+def cmd_run(c, a):
+    m = token_machine(c, a.token)
+    if not a.cmd:
+        die("hwlock run TOKEN -- CMD...")
+    t = time.time()
+    with locked():
+        d = load(m)
+        extend(claim(d, a.token, t), t)
+        save(d)
+    env = dict(os.environ, HWLOCK_TOKEN=a.token, HWLOCK_MACHINE=m, HWLOCK_SSH=shlex.join(ssh_base(c, m)))
+    addr, why = probe(c, m)
+    if addr:
+        env["HWLOCK_HOST"] = f"{ssh_user(c, m)}@{addr}"
+        env["HWLOCK_ADDR"] = addr
+    else:
+        say(f"hwlock: note: {m} isn't reachable right now ({'; '.join(why)}), so $HWLOCK_HOST is unset.")
+    sys.exit(run_child(a.cmd, m, a.token, env))
+
+
+def cmd_wait_up(c, a):
+    m = token_machine(c, a.token)
+    start = time.time()
+    deadline = start + a.timeout
+    with locked():
+        d = load(m)
+        extend(claim(d, a.token, start), start)
+        save(d)
+    if a.down_first:
+        went_down = False
+        while time.time() < min(deadline, start + 180):
+            addr, _ = probe(c, m)
+            if not addr:
+                went_down = True
+                break
+            time.sleep(3)
+        if not went_down:
+            say(f"hwlock: note: {m} never went down within {span(min(a.timeout, 180))} (did the reboot run?)")
+    last_why = []
+    while time.time() < deadline:
+        if not heartbeat(m, a.token):
+            die(f"you no longer hold {m}: {lost_reason(m, a.token)}", EXIT_LOST)
+        addr, last_why = probe(c, m)
+        if addr:
+            r = subprocess.run(
+                ssh_base(c, m) + [addr, "uname -nr; cut -d' ' -f1 /proc/uptime 2>/dev/null || true"],
+                capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+            )
+            out = r.stdout.split()
+            try:
+                out[-1] = f"(uptime {span(float(out[-1]))})"
+            except (IndexError, ValueError):
+                pass
+            print(f"{m} is up at {addr} after {span(time.time() - start)}: {' '.join(out)}")
+            return
+        time.sleep(10)
+    die(
+        f"{m} isn't back after {span(a.timeout)} ({'; '.join(last_why)}). Don't keep polling: tell the user what you "
+        f"booted and what the screen might show. If the user has to act, run "
+        f"hwlock release {a.token} --state needs-human --note \"...\" so nobody else touches it.",
+        EXIT_UNREACH,
+    )
+
+
+def cmd_peek(c, a):
+    m = resolve(c, a.machine)
+    if not a.cmd:
+        die("hwlock peek MACHINE -- CMD...   (read-only commands only)")
+    t = time.time()
+    with locked():
+        d = load(m)
+    lease = d["lease"]
+    if live(lease, t) and lease.get("quiet"):
+        die(
+            f"{m} is checked out in quiet mode by {who(lease['holder'])} for \"{lease['purpose']}\": "
+            f"a measurement is running, so no ssh at all until {clock(unix(lease['expires']))}.",
+            EXIT_BUSY,
+        )
+    if live(lease, t):
+        say(f"hwlock: note: {m} is checked out by {who(lease['holder'])} for \"{lease['purpose']}\". Read-only commands only.")
+    addr, why = probe(c, m)
+    if not addr:
+        die(f"{m} isn't reachable: " + "; ".join(why), EXIT_UNREACH)
+    sys.exit(subprocess.run(ssh_base(c, m) + [addr] + a.cmd).returncode)
+
+
+def cmd_mark(c, a):
+    m = resolve(c, a.machine)
+    t = time.time()
+    with locked():
+        d = load(m)
+        if a.token:
+            if token_machine(c, a.token) != m:
+                die(f"that token is for {token_machine(c, a.token)}, not {m}")
+            by = claim(d, a.token, t)["holder"]["label"]
+        elif a.state in ESCALATIONS:
+            by = holder()["label"]
+        else:
+            die(f"only the lease holder (--token) or the user (hwlock clear {m}) can mark it {a.state}")
+        d["state"], d["note"], d["state_by"], d["state_at"] = a.state, a.note or "", by, iso(t)
+        save(d)
+    log("mark", m, state=a.state, note=a.note, by=by)
+    say(f"Marked {nick(c, m)} {a.state}" + (f": {a.note}" if a.note else "."))
+
+
+def user_only(a, what):
+    """Guardrail preventing agents from clearing/breaking leases without explicit user instruction."""
+    if is_agent() and not a.user_said:
+        die(f"{what} is for the user. If the user told you to in this conversation, add --user-said \"<their words>\".")
+
+
+def cmd_clear(c, a):
+    user_only(a, "hwlock clear")
+    m = resolve(c, a.machine)
+    t = time.time()
+    with locked():
+        d = load(m)
+        old = d["state"]
+        d["state"], d["note"], d["state_by"], d["state_at"] = "ok", a.note or "", "user", iso(t)
+        save(d)
+    log("clear", m, from_state=old, note=a.note, user_said=a.user_said)
+    say(f"{nick(c, m)} state {old} -> ok.")
+    grant_notified(c, m)
+
+
+def cmd_break(c, a):
+    user_only(a, "hwlock break")
+    m = resolve(c, a.machine)
+    t = time.time()
+    with locked():
+        d = load(m)
+        lease = d["lease"]
+        if not lease:
+            die(f"{m} has no lease to break")
+        d["lease"] = None
+        save(d)
+    log("break", m, lease=lease["id"], holder=lease["holder"]["label"], note=a.note, user_said=a.user_said)
+    say(f"Dropped {who(lease['holder'])}'s lease on {m} (\"{lease['purpose']}\"). Its next hwlock call will tell it so.")
+    grant_notified(c, m)
+
+
+def cmd_log(c, a):
+    m = resolve(c, a.machine) if a.machine else None
+    evs = [e for e in read_log() if e["event"] != "renew" and (not m or e.get("machine") == m)][-a.n:]
+    for e in evs:
+        who_ = e.get("holder") or e.get("by") or ("user" if e["event"] in ("clear", "break") else "")
+        extra = (
+            e.get("reason")
+            or e.get("purpose")
+            or (f"state {e['state']}" if e.get("state") else "")
+            or (f"from {e['from_state']}" if e.get("from_state") else "")
+        )
+        note = f" — {e['note']}" if e.get("note") else ""
+        held = f" after {span(e['held_s'])}" if e.get("held_s") else ""
+        took = " (took over an expired lease)" if e.get("prev_lease") else ""
+        took += " (handed over by message)" if e.get("via") == "notify" else ""
+        print(f"{clock(unix(e['t'])):>12}  {e['machine']:7} {e['event']:8} {who_!r} {extra}{held}{took}{note}".rstrip())
+
+
+def main():
+    p = argparse.ArgumentParser(prog="hwlock", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd_name", required=True, metavar="COMMAND")
+
+    s = sub.add_parser("status", help="who holds what")
+    s.add_argument("machine", nargs="?")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("acquire", help="check out a machine; prints a token")
+    s.add_argument("machine")
+    s.add_argument("--for", dest="purpose", required=True, help="what you'll do, e.g. 'run kernel smoke test'")
+    s.add_argument("--ttl", type=dur, help="lease length between renewals (default 30m)")
+    s.add_argument("--max", type=dur, help="longest total hold (default 8h, at most 24h)")
+    s.add_argument("--wait", type=dur, help="queue for up to this long if busy (run it in the background)")
+    s.add_argument(
+        "--notify", action="store_true",
+        help="with --wait, in a T3 thread: return at once; the token arrives as a message when it's yours",
+    )
+    s.add_argument("--quiet", action="store_true", help="measurement running: nobody else may even peek")
+    s.add_argument("--as", dest="as_", help="label shown to others (default: T3 thread title)")
+    s.set_defaults(fn=cmd_acquire)
+
+    for name, fn, hlp in (
+        ("ssh", cmd_ssh, "run a command on the machine under your lease"),
+        ("run", cmd_run, "run a local command under your lease ($HWLOCK_SSH, $HWLOCK_HOST)"),
+    ):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("token")
+        s.add_argument("cmd", nargs=argparse.REMAINDER)
+        s.set_defaults(fn=fn)
+
+    s = sub.add_parser("wait-up", help="wait for the machine to come back after a reboot")
+    s.add_argument("token")
+    s.add_argument("--down-first", action="store_true", help="first wait (up to 3m) for it to go down")
+    s.add_argument("--timeout", type=dur, default=dur("8m"))
+    s.set_defaults(fn=cmd_wait_up)
+
+    s = sub.add_parser("renew", help="extend your lease")
+    s.add_argument("token")
+    s.add_argument("--ttl", type=dur)
+    s.add_argument("--idle-ok", action="store_true", help="you're ending your turn on purpose: no reminders until it expires")
+    s.set_defaults(fn=cmd_renew)
+
+    s = sub.add_parser("release", help="give the machine back, saying what state it is in")
+    s.add_argument("token")
+    s.add_argument("--state", required=True, choices=STATES)
+    s.add_argument("--note", help="what state you left it in: installed build, pending reboot, anything odd")
+    s.set_defaults(fn=cmd_release)
+
+    s = sub.add_parser("peek", help="read-only command without a lease")
+    s.add_argument("machine")
+    s.add_argument("cmd", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_peek)
+
+    s = sub.add_parser("mark", help="record the machine's state (down/needs-human/unknown without a lease)")
+    s.add_argument("machine")
+    s.add_argument("state", choices=STATES)
+    s.add_argument("--note")
+    s.add_argument("--token")
+    s.set_defaults(fn=cmd_mark)
+
+    s = sub.add_parser("dequeue", help="leave the --notify queue for a machine")
+    s.add_argument("machine")
+    s.set_defaults(fn=cmd_dequeue)
+
+    s = sub.add_parser("sweep", help="(timer) remind idle holders, release abandoned leases, serve --notify")
+    s.set_defaults(fn=cmd_sweep)
+
+    s = sub.add_parser("log", help="history")
+    s.add_argument("machine", nargs="?")
+    s.add_argument("-n", type=int, default=20)
+    s.set_defaults(fn=cmd_log)
+
+    for name, fn, hlp in (
+        ("clear", cmd_clear, "(user) set the state back to ok"),
+        ("break", cmd_break, "(user) drop someone's live lease"),
+    ):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("machine")
+        s.add_argument("--note")
+        s.add_argument("--user-said", help="for agents: the user's words telling you to do this")
+        s.set_defaults(fn=fn)
+
+    a = p.parse_args()
+    if getattr(a, "cmd", None) and a.cmd[:1] == ["--"]:
+        a.cmd = a.cmd[1:]
+    c = load_cfg()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    a.fn(c, a)
+
+
+if __name__ == "__main__":
+    main()

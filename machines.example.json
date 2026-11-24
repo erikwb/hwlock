@@ -1,0 +1,20 @@
+{
+  "user": "tester",
+  "identity": "~/.ssh/id_ed25519",
+  "default_ttl": "30m",
+  "max_hold": "8h",
+  "machines": {
+    "lab-box-a": {
+      "aliases": ["box-a", "a"],
+      "desc": "Primary test machine",
+      "host_key_alias": "lab-box-a-hostkey",
+      "addrs": ["192.0.2.10", "lab-box-a.local"]
+    },
+    "lab-box-b": {
+      "aliases": ["box-b", "b"],
+      "desc": "Secondary test machine",
+      "host_key_alias": "lab-box-b-hostkey",
+      "addrs": ["192.0.2.11", "lab-box-b.local"]
+    }
+  }
+}
