@@ -23,6 +23,16 @@ A single-file, zero-dependency Python CLI for coordinating exclusive leases on s
 
 3. *(Optional)* Run `hwlock sweep` every minute (e.g. via a systemd user timer or cron) if you use `--notify` or idle-thread cleanup.
 
+4. *(Recommended)* Install the bundled agent skill at [`skills/hwlock/SKILL.md`](skills/hwlock/SKILL.md) (for example, symlink `skills/hwlock` into your agent's skills directory) so coding agents consistently use `hwlock` instead of raw `ssh` and handle lease states and exit codes cleanly.
+
+## Make It Yours
+
+`hwlock` is intentionally a small, single-file script with no dependencies—treat it as a starting point rather than a one-size-fits-all tool. The easiest way to adopt it is to point your coding agent at this repo and ask it to tailor everything to your lab:
+
+- **Config (`machines.json`):** populate your hosts, aliases, SSH users/keys, and pinned `known_hosts` aliases.
+- **Script (`hwlock`):** adapt the states, timeouts, `wait-up` probe, or notification/liveness hooks to match your target OS, power controllers, or agent runner.
+- **Skill (`skills/hwlock/SKILL.md`):** add your lab's specific machine names, deploy/flash commands, recovery procedures, and conventions so agents follow your exact workflow.
+
 ## Usage
 
 ```bash
